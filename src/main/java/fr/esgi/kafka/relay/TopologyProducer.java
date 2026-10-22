@@ -2,11 +2,17 @@ package fr.esgi.kafka.relay;
 
 import fr.esgi.kafka.relay.common.EventTimeExtractor;
 import fr.esgi.kafka.relay.common.JsonSerdes;
+import fr.esgi.kafka.relay.model.Campaign;
+import fr.esgi.kafka.relay.model.CampaignGeoCount;
+import fr.esgi.kafka.relay.model.CampaignImpression;
+import fr.esgi.kafka.relay.model.CampaignSpend;
 import fr.esgi.kafka.relay.model.Click;
+import fr.esgi.kafka.relay.model.GeoCampaignTop;
 import fr.esgi.kafka.relay.model.DlqRecord;
 import fr.esgi.kafka.relay.model.Impression;
 import fr.esgi.kafka.relay.model.SiteViewability;
 import fr.esgi.kafka.relay.model.ViewabilityCount;
+import fr.esgi.kafka.relay.processing.ImpressionDeduplicator;
 import fr.esgi.kafka.relay.validation.EventValidator;
 import fr.esgi.kafka.relay.validation.Validated;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -20,14 +26,18 @@ import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
+import org.apache.kafka.streams.kstream.GlobalKTable;
 import org.apache.kafka.streams.kstream.Grouped;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Named;
 import org.apache.kafka.streams.kstream.Produced;
+import org.apache.kafka.streams.kstream.Repartitioned;
 import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.ValueMapper;
 import org.apache.kafka.streams.kstream.Windowed;
+import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.Stores;
 import org.apache.kafka.streams.state.WindowStore;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
@@ -45,8 +55,13 @@ public class TopologyProducer {
     /** En dessous de ce volume, le taux n'est pas significatif. */
     public static final int VIEWABILITY_MIN_IMPRESSIONS = 50;
     public static final Duration VIEWABILITY_WINDOW = Duration.ofMinutes(10);
+    public static final Duration TOP_WINDOW = Duration.ofMinutes(15);
+    public static final Duration TOP_ADVANCE = Duration.ofMinutes(5);
     /** Les retardataires arrivent jusqu'a 180 min apres leur horodatage. */
     public static final Duration LATE_EVENTS_GRACE = Duration.ofMinutes(180);
+    /** Memoire des impression_id deja factures : la retention du cluster partage. */
+    public static final Duration DEDUP_WINDOW = Duration.ofHours(24);
+    public static final String DEDUP_STORE = "spend-dedup-store";
     /** Un humain ne clique pas en moins d'une seconde. */
     public static final long BOT_MAX_DELAY_MS = 1000;
     /** Nombre de clics rapides a partir duquel on alerte. */
@@ -86,12 +101,10 @@ public class TopologyProducer {
 
         // RLY-3 - Top campagnes par pays (hopping 15/5 min,
         //         jointure GlobalKTable relay.campaigns) -> Topics.TOP_BY_GEO
-        //         Certaines campagnes servies sont ABSENTES du catalogue :
-        //         elles doivent survivre a la jointure.
+        buildTopByGeo(builder, impressions);
 
         // RLY-4 - Depense par campagne                    -> Topics.SPEND
-        //         Cumul de paid_price_eur par campaign_id (KTable,
-        //         aggregate). Une impression n'est facturee qu'UNE fois.
+        buildSpend(builder, impressions);
 
         // RLY-5 - Tunnel impression -> clic, clics robots -> Topics.ALERTS_CLICKBOT
         //         Jointure flux-flux sur impression_id (les deux topics
@@ -121,6 +134,62 @@ public class TopologyProducer {
                 .map((window, count) -> KeyValue.pair(window.key(), JsonSerdes.toJson(toViewability(window, count))),
                         Named.as("viewability-to-json"))
                 .to(Topics.VIEWABILITY, Produced.with(Serdes.String(), Serdes.String()));
+    }
+
+    private static void buildTopByGeo(StreamsBuilder builder, KStream<String, Impression> impressions) {
+        GlobalKTable<String, String> campaigns = builder.globalTable(
+                Topics.CAMPAIGNS,
+                Consumed.with(Serdes.String(), Serdes.String()),
+                Materialized.<String, String, KeyValueStore<Bytes, byte[]>>as("campaigns-store"));
+
+        impressions
+                .leftJoin(campaigns,
+                        (userId, imp) -> imp.campaignId(),
+                        (imp, campaignJson) -> CampaignImpression.of(
+                                imp, JsonSerdes.parseOrNull(campaignJson, Campaign.class)),
+                        Named.as("impressions-join-campaigns"))
+                .selectKey((userId, imp) -> imp.geo() + "|" + imp.campaignId(),
+                        Named.as("impressions-by-geo-campaign"))
+                .groupByKey(Grouped.with("top-by-geo", Serdes.String(), JsonSerdes.of(CampaignImpression.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(TOP_WINDOW, LATE_EVENTS_GRACE).advanceBy(TOP_ADVANCE))
+                .aggregate(CampaignGeoCount::empty,
+                        (geoCampaign, imp, count) -> count.add(imp),
+                        Named.as("top-by-geo-count"),
+                        Materialized.<String, CampaignGeoCount, WindowStore<Bytes, byte[]>>as("top-by-geo-store")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(JsonSerdes.of(CampaignGeoCount.class)))
+                .toStream(Named.as("top-by-geo-updates"))
+                .map((window, count) -> KeyValue.pair(count.geo(), JsonSerdes.toJson(new GeoCampaignTop(
+                                count.geo(), count.campaignId(), count.name(), count.advertiser(), count.inCatalog(),
+                                window.window().startTime().toString(), window.window().endTime().toString(),
+                                count.impressions()))),
+                        Named.as("top-by-geo-to-json"))
+                .to(Topics.TOP_BY_GEO, Produced.with(Serdes.String(), Serdes.String()));
+    }
+
+    private static void buildSpend(StreamsBuilder builder, KStream<String, Impression> impressions) {
+        builder.addStateStore(Stores.windowStoreBuilder(
+                Stores.persistentWindowStore(DEDUP_STORE, DEDUP_WINDOW.plus(LATE_EVENTS_GRACE), DEDUP_WINDOW, false),
+                Serdes.String(), Serdes.Long()));
+
+        impressions
+                .selectKey((userId, imp) -> imp.impressionId(), Named.as("impressions-by-id"))
+                .repartition(Repartitioned.<String, Impression>as("spend-dedup-by-id")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(JsonSerdes.of(Impression.class)))
+                .processValues(() -> new ImpressionDeduplicator(DEDUP_STORE, DEDUP_WINDOW),
+                        Named.as("spend-dedup"), DEDUP_STORE)
+                .selectKey((impressionId, imp) -> imp.campaignId(), Named.as("impressions-by-campaign"))
+                .groupByKey(Grouped.with("spend-by-campaign", Serdes.String(), JsonSerdes.of(Impression.class)))
+                .aggregate(CampaignSpend::empty,
+                        (campaignId, imp, spend) -> spend.add(campaignId, imp),
+                        Named.as("spend-sum"),
+                        Materialized.<String, CampaignSpend, KeyValueStore<Bytes, byte[]>>as("spend-store")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(JsonSerdes.of(CampaignSpend.class)))
+                .toStream(Named.as("spend-updates"))
+                .mapValues(spend -> JsonSerdes.toJson(spend.toReport()), Named.as("spend-to-json"))
+                .to(Topics.SPEND, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     private static SiteViewability toViewability(Windowed<String> window, ViewabilityCount count) {
