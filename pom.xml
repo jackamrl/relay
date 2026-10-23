@@ -57,6 +57,13 @@
       <artifactId>rest-assured</artifactId>
       <scope>test</scope>
     </dependency>
+    <!-- RLY-6 : meme version que kafka-streams, fournie par le BOM Quarkus (3.9.0). -->
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-streams-test-utils</artifactId>
+      <version>3.9.0</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
