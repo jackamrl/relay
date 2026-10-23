@@ -7,6 +7,8 @@ import fr.esgi.kafka.relay.model.CampaignGeoCount;
 import fr.esgi.kafka.relay.model.CampaignImpression;
 import fr.esgi.kafka.relay.model.CampaignSpend;
 import fr.esgi.kafka.relay.model.Click;
+import fr.esgi.kafka.relay.model.ClickBotAlert;
+import fr.esgi.kafka.relay.model.ClickMatch;
 import fr.esgi.kafka.relay.model.GeoCampaignTop;
 import fr.esgi.kafka.relay.model.DlqRecord;
 import fr.esgi.kafka.relay.model.Impression;
@@ -28,6 +30,8 @@ import org.apache.kafka.streams.kstream.Branched;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.GlobalKTable;
 import org.apache.kafka.streams.kstream.Grouped;
+import org.apache.kafka.streams.kstream.JoinWindows;
+import org.apache.kafka.streams.kstream.StreamJoined;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.kstream.Named;
@@ -59,6 +63,8 @@ public class TopologyProducer {
     public static final Duration TOP_ADVANCE = Duration.ofMinutes(5);
     /** Les retardataires arrivent jusqu'a 180 min apres leur horodatage. */
     public static final Duration LATE_EVENTS_GRACE = Duration.ofMinutes(180);
+    /** Fenetre de la jointure flux-flux impression x clic. */
+    public static final Duration CLICK_JOIN_WINDOW = Duration.ofMinutes(30);
     /** Memoire des impression_id deja factures : la retention du cluster partage. */
     public static final Duration DEDUP_WINDOW = Duration.ofHours(24);
     public static final String DEDUP_STORE = "spend-dedup-store";
@@ -107,11 +113,7 @@ public class TopologyProducer {
         buildSpend(builder, impressions);
 
         // RLY-5 - Tunnel impression -> clic, clics robots -> Topics.ALERTS_CLICKBOT
-        //         Jointure flux-flux sur impression_id (les deux topics
-        //         sont clees par user_id : il faut re-clef). Un clic a
-        //         moins de BOT_MAX_DELAY_MS de son impression est un clic
-        //         robot ; alerter au-dela de BOT_MIN_CLICKS clics robots
-        //         par user sur une fenetre de botWindowMinutes.
+        buildClickbots(impressions, clicks);
 
         // RLY-6 (bonus) - Tests unitaires TopologyTestDriver (cf. README)
 
@@ -190,6 +192,48 @@ public class TopologyProducer {
                 .toStream(Named.as("spend-updates"))
                 .mapValues(spend -> JsonSerdes.toJson(spend.toReport()), Named.as("spend-to-json"))
                 .to(Topics.SPEND, Produced.with(Serdes.String(), Serdes.String()));
+    }
+
+    private void buildClickbots(KStream<String, Impression> impressions, KStream<String, Click> clicks) {
+        KStream<String, Impression> impressionsById = impressions
+                .selectKey((userId, imp) -> imp.impressionId(), Named.as("join-impressions-key"))
+                .repartition(Repartitioned.<String, Impression>as("join-impressions-by-id")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(JsonSerdes.of(Impression.class)));
+
+        KStream<String, Click> clicksById = clicks
+                .selectKey((userId, click) -> click.impressionId(), Named.as("join-clicks-key"))
+                .repartition(Repartitioned.<String, Click>as("join-clicks-by-id")
+                        .withKeySerde(Serdes.String())
+                        .withValueSerde(JsonSerdes.of(Click.class)));
+
+        Duration botWindow = Duration.ofMinutes(botWindowMinutes);
+        impressionsById
+                .join(clicksById,
+                        ClickMatch::from,
+                        JoinWindows.ofTimeDifferenceAndGrace(CLICK_JOIN_WINDOW, LATE_EVENTS_GRACE),
+                        StreamJoined.<String, Impression, Click>as("impression-click-join")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(JsonSerdes.of(Impression.class))
+                                .withOtherValueSerde(JsonSerdes.of(Click.class)))
+                .filter((impressionId, match) -> match.isBot(BOT_MAX_DELAY_MS), Named.as("bot-clicks-only"))
+                .selectKey((impressionId, match) -> match.userId(), Named.as("bot-clicks-by-user"))
+                .groupByKey(Grouped.with("bot-clicks", Serdes.String(), JsonSerdes.of(ClickMatch.class)))
+                .windowedBy(TimeWindows.ofSizeAndGrace(botWindow, LATE_EVENTS_GRACE))
+                .count(Named.as("bot-clicks-count"),
+                        Materialized.<String, Long, WindowStore<Bytes, byte[]>>as("bot-clicks-store")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(Serdes.Long()))
+                .toStream(Named.as("bot-clicks-updates"))
+                .filter((window, count) -> count >= BOT_MIN_CLICKS, Named.as("bot-alerts-only"))
+                .map((window, count) -> KeyValue.pair(window.key(), JsonSerdes.toJson(new ClickBotAlert(
+                                window.key(),
+                                window.window().startTime().toString(),
+                                window.window().endTime().toString(),
+                                botWindowMinutes,
+                                count))),
+                        Named.as("bot-alerts-to-json"))
+                .to(Topics.ALERTS_CLICKBOT, Produced.with(Serdes.String(), Serdes.String()));
     }
 
     private static SiteViewability toViewability(Windowed<String> window, ViewabilityCount count) {
